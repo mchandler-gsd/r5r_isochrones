@@ -1,0 +1,288 @@
+---
+title: "Travel Times and Cumulative Access"
+author: "Miles Chandler"
+format: html
+editor: visual
+---
+
+#packages
+
+```{r}
+library(here)
+library(raster)
+library(osmdata)
+library(osmextract)
+library(sf)
+library(data.table)
+library(ggplot2)
+library(interp)
+library(plotly)
+library(elevatr)
+library(tidytransit)
+library(here)
+library(tigris)
+library(stringr)
+library(tidyverse)
+library(usethis)
+library(tidycensus)
+library(circlize)
+library(gtfsio)
+library(mapview)
+library(lehdr)
+library(gtfstools)
+
+rJavaEnv::rje_consent(provided = TRUE)
+
+##Run if Java Isnt installed
+rJavaEnv::java_quick_install(version = 21)
+
+# check if Java was successfully installed
+rJavaEnv::java_check_version_rjava()
+
+library(r5r)
+library(rJavaEnv)
+library(rJava)
+
+```
+
+#java options
+
+```{r}
+
+#check on the Java
+rJavaEnv::java_check_version_rjava()
+
+options(java.parameters = "-Xmx8g")
+
+```
+
+#setup
+
+```{r}
+#r5r directory
+
+here5r<-here("r5rdir")
+
+list.files(here5r)
+## inspect things if you want
+
+bosGTFS<-tidytransit::read_gtfs(paste0(here5r, "/newnew.zip"))
+
+#add OSM street data
+boston<-core_based_statistical_areas(year = 2023 )%>%
+  filter(NAME %like% "Boston")
+
+roads<-oe_get(place= "us/massachusetts",
+              boundary = boston,
+              layer="lines",
+              query = "SELECT highway, geometry FROM 'lines' WHERE highway IS NOT NULL",
+              download_directory= here5r)
+
+
+## Check the roads out if you want
+bosroads<-oe_read(file_path = paste0(here5r, "/geofabrik_massachusetts-latest.osm.pbf"))
+```
+
+# Validation stuff
+
+```{r}
+
+latest_validator<- download_validator(here("r5rdir"))
+
+validation_report <- validate_gtfs(gtfs= here(here5r, "/newnew.zip"), output_path = here("R Output"), 
+                                   validator_path =here("r5rdir/gtfs-validator-v6.0.0.jar"))
+
+```
+
+#service pattern stuff
+
+```{r}
+
+sp<-bosGTFS%>%set_servicepattern()
+
+
+sp_summary<-sp$trips%>%
+  left_join(sp$.$servicepatterns, by="service_id")%>%
+  left_join(sp$stop_times, by="trip_id")%>%
+  group_by(servicepattern_id)%>%
+  summarise(trips=n(),
+    routes=n_distinct(route_id),
+stops=(n_distinct(stop_id)/2))
+
+
+#service calendar
+s_calendar<-bosGTFS$.$dates_services%>%
+  mutate(wday=wday(date),
+week_nr=week(date))%>%
+  group_by(as.numeric(week_nr))%>%
+  mutate(week_first_date=min(date))%>%
+  group_by(service_id)%>% 
+  filter(any(wday==1),
+  length(date)>7)%>%
+  ungroup()
+
+#set one type of service
+weekday_service <- "FallWeekday"
+
+service_ids <- bosGTFS$.$dates_service%>%
+  filter(service_id %in% weekday_service) %>%
+  pull(service_id)
+
+week_labels = s_calendar %>%
+  select(week_nr, week_first_date) %>%
+  unique()
+
+```
+
+#visualize service calendar
+
+```{r}
+f<-ggplot(s_calendar) +
+  geom_tile(aes(x = wday, y = week_nr), color = "#747474") +
+  facet_wrap(~service_id, nrow = 5) +
+  scale_x_discrete(drop = F) +
+  scale_y_continuous(trans = "reverse", breaks = week_labels$week_nr) +
+  #theme_minimal(base_family = "Fragment Mono") +
+  theme(legend.position = "bottom", axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(x = NULL, y = "Week") 
+
+f
+```
+
+#stop frequency
+
+```{r}
+
+
+bosGTFS$stops<-bosGTFS$stops%>%
+  filter(!is.na(stop_lat))
+
+spatialstops<-gtfs_as_sf(bosGTFS, crs = "WGS84")
+
+stop_freq<-get_stop_frequency(bosGTFS, start_time = "09:00:00",
+                              end_time = "17:00:00")%>%
+  left_join(bosGTFS$stops)%>%
+  st_as_sf(coords=c("stop_lon", "stop_lat"), crs=st_crs(bosroads))%>%
+  mutate(frequent= if_else(mean_headway<=900, "frequent", "infrequent"))%>%
+  distinct(stop_id, frequent, .keep_all = TRUE)%>%
+  st_transform(stop_freq, crs = st_crs(bosroads))
+
+```
+
+#check out where frequent stops are
+
+```{r}
+mapview(stop_freq)
+```
+
+#isochrone stuff
+
+```{r}
+
+grid<-st_make_grid(st_transform(boston, 6855), square = FALSE, cellsize = 3000)%>%
+  st_sf()%>%
+  st_transform(crs=st_crs(boston))%>%
+  st_filter(boston)%>%
+  rowid_to_column("gridid")%>%
+  mutate(gridid=as.character(gridid))
+
+#employment 
+blocks<-blocks(state = 'ma', year=2022)%>%
+  transmute(geoid=GEOID20)
+
+wac<-grab_lodes(state = 'ma', year=2022, lodes_type = "wac", job_type = "JT00", use_cache = TRUE)%>%
+  transmute(geoid=w_geocode,
+            jobs=C000, 
+            year,
+            type="job")%>%
+  inner_join(blocks)%>%
+  st_as_sf()%>%
+  st_centroid
+
+```
+
+##Setup r5r network
+
+```{r}
+#set dir
+here5r<-here("r5rdir")
+#network
+r5rnetwork<-here5r%>%build_network()
+
+```
+
+```{r}
+
+jobsgrid<-aggregate(st_transform(wac, 6855)['jobs'], by=st_transform(grid, 6855)['gridid'], sum)
+jobsgrid<-jobsgrid%>%filter(!is.na(jobs))
+
+bostonboundary<-places(state='ma', year=2022)%>%
+  filter(str_detect(NAME,  "Boston"))
+
+
+gridpoints<-grid%>%
+  st_centroid()%>%
+  transmute(id=gridid, 
+            lat=st_coordinates(.)[,2],
+             lon=st_coordinates(.)[,1])%>%
+  st_drop_geometry()%>%
+  find_snap(points=., 
+            r5r_core = r5rnetwork)%>%
+  filter(found!=FALSE)%>%
+  select(id=point_id,
+         lat=snap_lat,
+         lon=snap_lon)
+
+
+time_region <- as.POSIXct("5-10-2025 12:30:00",
+                                 format = "%d-%m-%Y %H:%M:%S")
+
+#get travel times between grids
+ttm<-travel_time_matrix(
+  r5rnetwork, 
+  departure_datetime = time_region,
+  origins=gridpoints,
+  destinations = gridpoints,
+  mode="BUS",
+  max_trip_duration = 30
+)
+
+stop_r5()
+```
+
+##Bus Travel Hex Isochrones
+
+```{r}
+#find cell with nubian station
+nubian<-437
+
+#isochrones
+ttm_isochrone<-ttm%>%
+  filter(from_id==nubian)%>%
+  left_join(grid, by=c("to_id"="gridid"))%>%
+  st_as_sf()
+
+mapview(ttm_isochrone, zcol="travel_time_p50")
+
+```
+
+## 
+
+```{r}
+##nubian again
+lat<-42.3296244 
+lon<- -71.0839372
+id<- "nubian"
+nubianpt<-data.frame(lat, lon, id)
+
+##times
+time_region <- as.POSIXct("5-10-2025 12:30:00",
+                                 format = "%d-%m-%Y %H:%M:%S")
+
+r5rnetwork<-here5r%>%build_network()
+#bus isos
+busch<-isochrone(r5r_network = r5rnetwork, origins =nubianpt, mode = "bus", departure_datetime =  time_region, cutoffs= c(0,10))
+
+stop_r5()
+
+```
